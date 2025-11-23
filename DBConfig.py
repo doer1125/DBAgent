@@ -12,11 +12,11 @@ load_dotenv()
 
 class DBConfig:
     def __init__(self):
-        self.host = os.getenv("MYSQL_HOST", "localhost")
-        self.port = int(os.getenv("MYSQL_PORT", "3306"))
-        self.user = os.getenv("MYSQL_USER","root")
-        self.password = os.getenv("MYSQL_PASSWORD","WLTlongjin123!")
-        self.database = os.getenv("MYSQL_DATABASE","lj_xc_hotline_ids")
+        self.host = os.getenv("MYSQL_HOST")
+        self.port = int(os.getenv("MYSQL_PORT"))
+        self.user = os.getenv("MYSQL_USER")
+        self.password = os.getenv("MYSQL_PASSWORD")
+        self.database = os.getenv("MYSQL_DATABASE")
 
         # 验证必要的环境变量
         if not all([self.user, self.password, self.database]):
@@ -51,5 +51,6 @@ class DBConfig:
             return False
 
 
-# if __name__ == "__main__":
-#     # success = test_connection()
+if __name__ == "__main__":
+    config = DBConfig()
+    config.test_connection()
