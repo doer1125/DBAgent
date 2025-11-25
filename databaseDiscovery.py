@@ -24,6 +24,7 @@ from DBConfig import DBConfig
 from dotenv import load_dotenv
 import httpx
 import openai
+import jieba
 
 import mysql.connector
 from mysql.connector import Error
@@ -40,6 +41,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Suppress jieba logging output
+logging.getLogger("jieba").setLevel(logging.WARNING)
+
 
 load_dotenv()
 
@@ -209,8 +213,10 @@ class DiscoveryAgent:
             ```
 
             Instructions:
-            Create a single JSON object for the table. The object should have keys "tableName" and "columns".
-            Each object in the "columns" array should have "columnName", "columnType", "isOptional", and "foreignKeyReference".
+            Create a single JSON object for the table. The object should have keys "tableName", "description", and "columns".
+            Extract the table comment as the "description". If no comment is available, set "description" to null.
+            Each object in the "columns" array should have "columnName", "columnType", "isOptional", "columnDescription", and "foreignKeyReference".
+            Extract the column comment as "columnDescription". If no comment is available, set "columnDescription" to null.
             For "isOptional", use `false` if "NOT NULL" is present, otherwise `true`.
             For "foreignKeyReference", set it to `null` for now.
 
@@ -339,6 +345,7 @@ class DiscoveryAgent:
             nodeIds += 1
             G.add_node(nodeIds)
             G.nodes[nodeIds]['tableName'] = table["tableName"]
+            G.nodes[nodeIds]['description'] = table.get("description")
             labeldict[nodeIds] = table["tableName"]
 
             for column in table["columns"]:
@@ -347,6 +354,7 @@ class DiscoveryAgent:
                 G.nodes[columnIds]['columnName'] = column["columnName"]
                 G.nodes[columnIds]['columnType'] = column["columnType"]
                 G.nodes[columnIds]['isOptional'] = column["isOptional"]
+                G.nodes[columnIds]['columnDescription'] = column.get("columnDescription") # Add column description
                 labeldict[columnIds] = column["columnName"]
                 canonicalColumns[table["tableName"] + column["columnName"]] = columnIds
                 G.add_edge(nodeIds, columnIds)
@@ -383,15 +391,518 @@ class DiscoveryAgent:
         plt.show()
 
 
+class InferenceAgent:
+    def __init__(self):
+        # Initialize configuration, toolkit, and tools
+        self.config = Config()
+        self.toolkit = SQLDatabaseToolkit(db=self.config.db_engine, llm=self.config.llm)
+        self.tools = self.toolkit.get_tools()
+        self.chat_prompt = self.create_chat_prompt()
+
+        # Create an OpenAI-based agent with tools and prompt
+        self.agent = create_openai_functions_agent(
+            llm=self.config.llm,
+            prompt=self.chat_prompt,
+            tools=self.tools
+        )
+
+        # Configure the agent executor with runtime settings
+        self.agent_executor = AgentExecutor.from_agent_and_tools(
+            agent=self.agent,
+            tools=self.tools,
+            verbose=False,
+            handle_parsing_errors=True,
+            max_iterations=15
+        )
+
+        # Test the database connection
+        self.test_connection()
+
+    def test_connection(self):
+        # Verify the database connection by running a test query
+        try:
+            self.show_tables()
+            logger.info("Database connection successful")
+        except Exception as e:
+            logger.error(f"Database connection failed: {str(e)}")
+            raise
+
+    def show_tables(self) -> str:
+        # Query to list all tables and views in the MySQL database
+        q = '''
+            SELECT TABLE_NAME as name,
+                   TABLE_TYPE as type
+            FROM information_schema.tables
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_TYPE IN ('BASE TABLE', 'VIEW');
+            '''
+        return self.run_query(q)
+
+    def run_query(self, q: str) -> str:
+        # Execute a SQL query and handle errors if they occur
+        try:
+            return self.config.db_engine.run(q)
+        except Exception as e:
+            logger.error(f"Query execution failed: {str(e)}")
+            return f"Error executing query: {str(e)}"
+
+    def create_chat_prompt(self) -> ChatPromptTemplate:
+        # Create a system prompt to guide the LLM's behavior and response format
+        system_message = SystemMessagePromptTemplate.from_template(
+            """You are a database inference expert for a mysql database named {db_name}.
+            Your job is to answer questions by querying the database and providing clear, accurate results.
+
+            Rules:
+            1. ONLY execute queries that retrieve data
+            2. DO NOT provide analysis or recommendations
+            3. Format responses as:
+               Query Executed: [the SQL query used]
+               Results: [the query results]
+               Summary: [brief factual summary of the findings]
+            4. Keep responses focused on the data only
+            """
+        )
+
+        # Create a template for user-provided input
+        human_message = HumanMessagePromptTemplate.from_template("{input}\n\n{agent_scratchpad}")
+
+        # Combine system and human message templates into a chat prompt
+        return ChatPromptTemplate.from_messages([system_message, human_message])
+
+    def analyze_question_with_graph(self, db_graph: nx.Graph, question: str) -> dict:
+        """
+        Analyzes the user's question against the database graph to find relevant tables and columns.
+        It tokenizes Chinese questions and matches keywords against table names, table descriptions,
+        column names, and column descriptions.
+        """
+        logger.info(f"Starting graph analysis for question: '{question}'")
+
+        # Use jieba to tokenize the question for keyword matching
+        try:
+            question_keywords = set(jieba.cut(question.lower()))
+            # Remove short/common words
+            question_keywords = {kw for kw in question_keywords if len(kw.strip()) > 1}
+        except ImportError:
+            logger.warning("jieba is not installed. Falling back to simple whitespace tokenization. Please run 'pip install jieba'.")
+            question_keywords = set(question.lower().split())
+
+        analysis = {
+            'tables': [],
+            'relationships': [],
+            'columns': [],
+            'possible_paths': []
+        }
+        
+        matched_tables = []
+
+        # Iterate through all nodes to find tables
+        for node_id, node_data in db_graph.nodes(data=True):
+            if 'tableName' not in node_data:
+                continue
+
+            table_name = node_data['tableName'].lower()
+            table_description = (node_data.get('description') or "").lower()
+            
+            # Collect all column names and descriptions for this table to aid in scoring
+            column_search_text = []
+            for neighbor in db_graph.neighbors(node_id):
+                col_data = db_graph.nodes[neighbor]
+                if 'columnName' in col_data:
+                    column_search_text.append(col_data['columnName'].lower())
+                    if col_data.get('columnDescription'):
+                        column_search_text.append(col_data['columnDescription'].lower())
+            
+            # Combine table name, table description, and all column info for initial relevance scoring
+            search_text = table_name + " " + table_description + " " + " ".join(column_search_text)
+            
+            # Calculate a relevance score
+            score = 0
+            for keyword in question_keywords:
+                if keyword in search_text:
+                    # Give higher weight to matches in the table name or description
+                    if keyword in table_name or keyword in table_description:
+                        score += 2
+                    else: # Match in column name or description
+                        score += 1
+
+            if score > 0:
+                matched_tables.append({
+                    'score': score, 
+                    'node_id': node_id, 
+                    'node_data': node_data
+                })
+
+        # Sort tables by relevance score in descending order
+        matched_tables.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Process the most relevant tables
+        for match in matched_tables:
+            node_data = match['node_data']
+            node_id = match['node_id']
+            
+            logger.info(f"Found relevant table: {node_data['tableName']} (Score: {match['score']})")
+            
+            table_info = {'name': node_data['tableName'], 'columns': []}
+
+            # Find relevant columns in this table by checking against question keywords
+            for neighbor in db_graph.neighbors(node_id):
+                col_data = db_graph.nodes[neighbor]
+                if 'columnName' in col_data:
+                    col_name = col_data['columnName'].lower()
+                    col_description = (col_data.get('columnDescription') or "").lower()
+                    
+                    # Match keywords against column name AND column description
+                    if any(kw in col_name or kw in col_description for kw in question_keywords):
+                        table_info['columns'].append({
+                            'name': col_data['columnName'],
+                            'type': col_data['columnType'],
+                            'table': node_data['tableName'],
+                            'description': col_data.get('columnDescription') # Include column description in analysis output
+                        })
+                        logger.info(f"  -> Found relevant column: {col_data['columnName']} (Description: {col_data.get('columnDescription')})")
+
+            analysis['tables'].append(table_info)
+
+        return analysis
+
+    def query(self, text: str, db_graph) -> str:
+        # Execute a query using graph-based analysis or standard prompt
+        try:
+            if db_graph:
+                logger.info(f"Analyzing query with graph: '{text}'")
+
+                # Analyze the question with the database graph
+                graph_analysis = self.analyze_question_with_graph(db_graph, text)
+                logger.info(f"Graph Analysis Results:\n{json.dumps(graph_analysis, indent=2)}")
+
+                # Enhance the prompt with graph analysis context
+                enhanced_prompt = f"""
+                Database Structure Analysis:
+                - Available Tables: {[t['name'] for t in graph_analysis['tables']]}
+                - Table Relationships: {graph_analysis['possible_paths']}
+                - Relevant Columns: {[{'table': col['table'], 'name': col['name'], 'description': col.get('description')} for t in graph_analysis['tables'] for col in t['columns']]}
+
+                User Question: {text}
+
+                Use this structural information to form an accurate query.
+                """
+                logger.info("Enhanced prompt created with graph context")
+                return self.agent_executor.invoke({"input": enhanced_prompt, "db_name": self.config.db})['output']
+
+            logger.info(f"No graph available, executing standard query: '{text}'")
+            return self.agent_executor.invoke({"input": text, "db_name": self.config.db})['output']
+
+        except Exception as e:
+            # Handle errors during query processing
+            logger.error(f"Error in inference query: {str(e)}", exc_info=True)
+            return f"Error processing query: {str(e)}"
+
+
+class PlannerAgent:
+    def __init__(self):
+        # Initialize configuration and planner prompt
+        self.config = Config()
+        self.planner_prompt = self.create_planner_prompt()
+
+    def create_planner_prompt(self):
+        # Define the system template for planning instructions
+        system_template = """You are a friendly planning agent that creates specific plans to answer questions about THIS database only.
+
+        Available actions:
+        1. Inference: [query] - Use this prefix for database queries
+        2. General: [response] - Use this prefix for friendly responses
+
+        Create a SINGLE, SEQUENTIAL plan where:
+        - Each step should be exactly ONE line
+        - Each step must start with either 'Inference:' or 'General:'
+        - Steps must be in logical order
+        - DO NOT repeat steps
+        - Keep the plan minimal and focused
+
+        Example format:
+        Inference: Get all artists from the database
+        Inference: Count tracks per artist
+        General: Provide the results in a friendly way
+        """
+
+        # Define the human message template for user input
+        human_template = "Question: {question}\n\nCreate a focused plan with appropriate action steps."
+
+        # Combine system and human message templates into a chat prompt
+        return ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(system_template),
+            HumanMessagePromptTemplate.from_template(human_template)
+        ])
+
+    def create_plan(self, question: str) -> list:
+        # Generate a step-by-step plan to answer the given question
+        try:
+            logger.info(f"Creating plan for question: {question}")
+            response = self.config.llm.invoke(self.planner_prompt.format(
+                question=question
+            ))
+
+            # Extract and clean valid steps from the response
+            steps = [step.strip() for step in response.content.split('\n')
+                     if step.strip() and not step.lower() == 'plan:']
+
+            # Provide a fallback message if no steps are returned
+            if not steps:
+                return ["General: I'd love to help you explore the database! What would you like to know?"]
+
+            return steps
+
+        except Exception as e:
+            # Log and handle errors during plan creation
+            logger.error(f"Error creating plan: {str(e)}", exc_info=True)
+            return ["General: Error occurred while creating plan"]
+
+
+def db_graph_reducer():
+    # Reducer function for handling database graph updates
+    def _reducer(previous_value: Optional[nx.Graph], new_value: nx.Graph) -> nx.Graph:
+        if previous_value is None:  # If no previous graph exists, use the new graph
+            return new_value
+        return previous_value  # Otherwise, retain the existing graph
+    return _reducer
+
+def plan_reducer():
+    # Reducer function for updating plans
+    def _reducer(previous_value: Optional[List[str]], new_value: List[str]) -> List[str]:
+        return new_value if new_value is not None else previous_value  # Use the new plan if available
+    return _reducer
+
+def classify_input_reducer():
+    # Reducer function for input classification
+    def _reducer(previous_value: Optional[str], new_value: str) -> str:
+        return new_value  # Always replace with the latest classification
+    return _reducer
+
+class ConversationState(TypedDict):
+    # Defines the conversation state structure and associated reducers
+    question: str  # Current user question
+    input_type: Annotated[str, classify_input_reducer()]  # Classification of the input type
+    plan: Annotated[List[str], plan_reducer()]  # Step-by-step plan to respond to the question
+    db_results: NotRequired[str]  # Optional field for database query results
+    response: NotRequired[str]  # Optional field for generated response
+    db_graph: Annotated[Optional[nx.Graph], db_graph_reducer()] = None  # Optional field for database graph
+
+
+def classify_user_input(state: ConversationState) -> ConversationState:
+    """Classifies user input to determine if it requires database access."""
+
+    # Define a system prompt for classifying input into predefined categories
+    system_prompt = """You are an input classifier. Classify the user's input into one of these categories:
+    - DATABASE_QUERY: Questions about data, requiring database access
+    - GREETING: General greetings, how are you, etc.
+    - CHITCHAT: General conversation not requiring database
+    - FAREWELL: Goodbye messages
+
+    Respond with ONLY the category name."""
+
+    # Prepare messages for the LLM, including the system prompt and user's input
+    messages = [
+        ("system", system_prompt),  # Instructions for the LLM
+        ("user", state['question'])  # User's question for classification
+    ]
+
+    # Invoke the LLM with a zero-temperature setting for deterministic output
+    # llm = ChatOpenAI(temperature=0)
+    if 'config' not in state:
+        state['config'] = Config()
+
+    llm = state['config'].llm  # 使用已经配置好的 DeepSeek LLM
+    response = llm.invoke(messages)
+    classification = response.content.strip()  # Extract the category from the response
+
+    # Log the classification result
+    logger.info(f"Input classified as: {classification}")
+
+    # Update the conversation state with the input classification
+    return {
+        **state,
+        "input_type": classification
+    }
+
+
+class SupervisorAgent:
+    def __init__(self):
+        # Initialize configuration and agents
+        self.config = Config()
+        self.inference_agent = InferenceAgent()
+        self.planner_agent = PlannerAgent()
+        self.discovery_agent = DiscoveryAgent()
+
+        # Prompts for different types of responses
+        self.db_response_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a response coordinator that creates final responses based on:
+            Original Question: {question}
+            Database Results: {db_results}
+
+            Rules:
+            1. ALWAYS include ALL results from database queries in your response
+            2. Format the response clearly with each piece of information on its own line
+            3. Use bullet points or numbers for multiple pieces of information
+            """)
+        ])
+
+        self.chat_response_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a friendly AI assistant.
+            Respond naturally to the user's message.
+            Keep responses brief and friendly.
+            Don't make up information about weather, traffic, or other external data.
+            """)
+        ])
+
+    def create_plan(self, state: ConversationState) -> ConversationState:
+        # Generate a plan using the PlannerAgent
+        plan = self.planner_agent.create_plan(
+            question=state['question']
+        )
+
+        # Log the plan, separating inference and general steps
+        logger.info("Generated plan:")
+        inference_steps = [step for step in plan if step.startswith('Inference:')]
+        general_steps = [step for step in plan if step.startswith('General:')]
+
+        if inference_steps:
+            logger.info("Inference Steps:")
+            for i, step in enumerate(inference_steps, 1):
+                logger.info(f"  {i}. {step}")
+        if general_steps:
+            logger.info("General Steps:")
+            for i, step in enumerate(general_steps, 1):
+                logger.info(f"  {i}. {step}")
+
+        return {
+            **state,
+            "plan": plan
+        }
+
+    def execute_plan(self, state: ConversationState) -> ConversationState:
+        # Execute the generated plan step by step
+        results = []
+
+        try:
+            for step in state['plan']:
+                if ':' not in step:
+                    continue
+
+                step_type, content = step.split(':', 1)
+                content = content.strip()
+
+                if step_type.lower().strip() == 'inference':
+                    # Handle inference steps using the InferenceAgent
+                    try:
+                        result = self.inference_agent.query(content, state.get('db_graph'))
+                        results.append(f"Step: {step}\nResult: {result}")
+                    except Exception as e:
+                        logger.error(f"Error in inference step: {str(e)}", exc_info=True)
+                        results.append(f"Step: {step}\nError: Query failed - {str(e)}")
+                else:
+                    # Handle general steps
+                    results.append(f"Step: {step}\nResult: {content}")
+
+            # Return state with results
+            return {
+                **state,
+                "db_results": "\n\n".join(results) if results else "No results were generated."
+            }
+
+        except Exception as e:
+            logger.error(f"Error in execute_plan: {str(e)}", exc_info=True)
+            return {**state, "db_results": f"Error executing steps: {str(e)}"}
+
+    def generate_response(self, state: ConversationState) -> ConversationState:
+        # Generate the final response based on the input type
+        logger.info("Generating final response")
+        is_chat = state.get("input_type") in ["GREETING", "CHITCHAT", "FAREWELL"]
+        prompt = self.chat_response_prompt if is_chat else self.db_response_prompt
+
+        # Invoke the LLM to generate the response
+        response = self.config.llm.invoke(prompt.format(
+            question=state['question'],
+            db_results=state.get('db_results', '')
+        ))
+
+        # Update state with the response and clear the plan
+        return {**state, "response": response.content, "plan": []}
+
+def discover_database(state: ConversationState) -> ConversationState:
+    # Check if the database graph is already present in the state
+    if state.get('db_graph') is None:
+        logger.info("Performing one-time database schema discovery...")
+
+        # Use the DiscoveryAgent to generate the database graph
+        discovery_agent = DiscoveryAgent()
+        graph = discovery_agent.discover()
+
+        logger.info("Database schema discovery complete - this will be reused for future queries")
+
+        # Update the state with the discovered database graph
+        return {**state, "db_graph": graph}
+
+    # Return the existing state if the database graph already exists
+    return state
+
+
+
+def create_graph():
+    # Initialize the supervisor agent and state graph builder
+    supervisor = SupervisorAgent()
+    builder = StateGraph(ConversationState)
+
+    # Add nodes representing processing steps in the flow
+    builder.add_node("classify_input", classify_user_input)  # Classify the user input
+    builder.add_node("discover_database", discover_database)  # Perform database discovery
+    builder.add_node("create_plan", supervisor.create_plan)  # Create a plan based on input
+    builder.add_node("execute_plan", supervisor.execute_plan)  # Execute the generated plan
+    builder.add_node("generate_response", supervisor.generate_response)  # Generate the final response
+
+    # Define the flow of states
+    builder.add_edge(START, "classify_input")  # Start with input classification
+
+    # Conditionally proceed to database discovery or directly to response generation
+    builder.add_conditional_edges(
+        "classify_input",
+        lambda x: "discover_database" if x.get("input_type") == "DATABASE_QUERY" else "generate_response"
+    )
+
+    # Connect discovery to plan creation
+    builder.add_edge("discover_database", "create_plan")
+
+    # Conditionally execute the plan or generate a response if no plan exists
+    builder.add_conditional_edges(
+        "create_plan",
+        lambda x: "execute_plan" if x.get("plan") is not None else "generate_response"
+    )
+
+    # Connect execution to response generation
+    builder.add_edge("execute_plan", "generate_response")
+
+    # End the process after generating the response
+    builder.add_edge("generate_response", END)
+
+    # Compile and return the state graph
+    return builder.compile()
+
+
 if __name__ == "__main__":
     try:
         patch_all_clients()
-        agent = DiscoveryAgent()
-        G = agent.discover()
-        if G.number_of_nodes() > 0:
-            agent.plot_graph(G)
-        else:
-            logger.warning("Graph is empty. Nothing to plot.")
+        # agent = DiscoveryAgent()
+        # G = agent.discover()
+        # if G.number_of_nodes() > 0:
+        #     agent.plot_graph(G)
+        # else:
+        #     logger.warning("Graph is empty. Nothing to plot.")
+
+        # Create the graph for processing
+        graph = create_graph()
+
+        state = graph.invoke({"question": "有多少个用户现在？"})
+        print(f"State after second invoke: {state}")
+        print(f"Response 2: {state['response']}\n")
 
     except Exception as e:
         logger.error(f"An unrecoverable error occurred during the discovery process: {e}", exc_info=True)
